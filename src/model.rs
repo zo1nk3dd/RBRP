@@ -630,21 +630,23 @@ impl SeperationCallback {
         ctx.add_lazy(c!(lhs >= rhs as f64)).unwrap();
     }
 
-    fn add_tournament_cut(&self, ctx: &MIPSolCtx, route: Vec<&VarData>) {
+    fn add_tournament_cut(&self, ctx: &MIPSolCtx, route: Vec<usize>) {
         let k = route.len();
 
-        let lhs = route[0].x +
+        let lhs = self.var_data[route[0] * self.num_vertices + route[1]].x +
             (1..k-1).map(|i| {
+                // println!("");
                 (i+1..k).map(|j| {
-                    let var_data = &self.var_data[route[i].i * self.num_vertices + route[j].j];
-                    assert!(var_data.i == route[i].i && var_data.j == route[j].j, "VarData indices do not match");
+                    let var_data = &self.var_data[route[i] * self.num_vertices + route[j]];
+                    assert!(var_data.i == route[i] && var_data.j == route[j], "VarData indices do not match");
+                    // print!("{}, {}: ", var_data.i, var_data.j);
                     var_data.x
                 }).grb_sum()
             }).grb_sum();
 
-        let rhs = k-1;
+        let rhs = k-2;
         ctx.add_lazy(c!(lhs <= rhs as f64)).unwrap();
-        println!("Added tournament cut for route {:?}", route.iter().map(|vd| vd.i).collect::<Vec<_>>());
+        // println!("Added tournament cut for route {:?}, lt {}", route, rhs);
     }   
 }
 
@@ -737,7 +739,7 @@ impl Callback for SeperationCallback {
 
                             if theta_plus_max - theta_minus_min > self.capacity as f64 {
                                 if first_infeasible == -1 {
-                                    // println!("Tournament required");
+                                    // println!("Tournament required at index {}", k);
                                     first_infeasible = k as isize;
                                 }
                             }
@@ -752,7 +754,7 @@ impl Callback for SeperationCallback {
                         }
                         if sep_cap_added_cuts == false && first_infeasible > 0 {
                             // add tournament cut
-                            self.add_tournament_cut(&ctx, route[..(first_infeasible as usize + 1)].iter().map(|vd| *vd).collect());
+                            self.add_tournament_cut(&ctx, route[..(first_infeasible as usize + 1)].iter().map(|vd| vd.i).collect());
                             // println!("Added tournament cut");
                         }
                     }
