@@ -1,11 +1,9 @@
-use std::ops::Index;
-
-use grb::{attribute::{ConstrDoubleAttr::Slack, ModelDoubleAttr::ObjVal, VarDoubleAttr::{UB, X}}, callback::*, parameter::IntParam::{LazyConstraints, Threads}, prelude::*};
+use grb::{attribute::{ConstrDoubleAttr::Slack, ModelDoubleAttr::ObjVal, VarDoubleAttr::{UB, X}}, callback::*, constr::IneqExpr, parameter::{DoubleParam::TimeLimit, IntParam::{BranchDir, LazyConstraints}}, prelude::*};
 
 use crate::utils::*;
 
 pub struct CompactModel {
-    model: Model,
+    pub model: Model,
     gamma: usize,
     deviation: Option<f64>,
     data: RBRPData,
@@ -18,13 +16,20 @@ pub struct CompactModel {
     theta_d: Vec<Var>,
 
     clique_cuts: Vec<Constr>,
+    config: Config,
 }
 
 impl CompactModel {
-    pub fn new(filename: &str, gamma: usize, deviation: Option<f64>) -> Self {
+    pub fn new(filename: &str, config: Config) -> Self {
         // Read data from file
         let data = read_from_file(filename);
         let mut model = Model::new("RBRP Compact Model").unwrap();
+        let gamma = config.gamma;
+        let deviation = if config.dev > 0.0 {
+            Some(config.dev)
+        } else {
+            None
+        };
 
         // Create variables
         let x: Vec<Vec<Var>> = (0..data.num_vertices)
@@ -182,6 +187,7 @@ impl CompactModel {
             _theta_m: theta_m,
             theta_d,
             clique_cuts: vec![],
+            config,
         }
     }
 
@@ -217,6 +223,7 @@ impl CompactModel {
 
     pub fn solve(&mut self) {
         self.add_valid_inequalities();
+        self.model.set_param(TimeLimit, self.config.tlimit as f64).unwrap();
         self.model.optimize().unwrap();
         self.print_solution();
     }
@@ -298,21 +305,17 @@ fn dev(d: isize, p: f64) -> f64 {
 }
 
 pub struct BranchCutModel {
-    model: Model,
+    pub model: Model,
     gamma: usize,
-    deviation: Option<f64>,
+    deviation: f64,
     data: RBRPData,
-
     // Variables
     x: Vec<Vec<Var>>,
-    
-    _rounded_capacity_cuts: Vec<Constr>,
-    clique_cuts: Vec<Constr>,
-    _infeasibility_cuts: Vec<Constr>,
+    config: Config,
 }
 
 impl BranchCutModel {
-    pub fn new(filename: &str, gamma: usize, deviation: Option<f64>) -> Self {
+    pub fn new(filename: &str, config: Config) -> Self {
         // Read data from file
         let data = read_from_file(filename);
         let mut model = Model::new("RBRP Compact Model").unwrap();
@@ -332,6 +335,16 @@ impl BranchCutModel {
                 .collect::<Vec<Expr>>())
             .flatten()
             .grb_sum();
+
+        // let vehicle_obj_expr = (1..data.num_vertices)
+        //     .map(|i| {
+        //         model.set_obj_attr(BranchPriority, &x[0][i], 1).unwrap();
+        //         x[0][i]
+        //     })
+        //     .collect::<Vec<Var>>()
+        //     .grb_sum();
+
+        // model.add_constr("vehicle", c!(vehicle_obj_expr == 6.0)).unwrap();
 
         model.set_objective(obj_expr, Minimize).unwrap();
 
@@ -375,16 +388,11 @@ impl BranchCutModel {
 
         let mut bcutmodel = BranchCutModel { 
             model,
-            gamma,
-            deviation,
+            gamma: config.gamma,
+            deviation: config.dev,
             data,
-
-            // Variables
             x,
-            
-            _rounded_capacity_cuts: vec![],
-            clique_cuts: vec![],
-            _infeasibility_cuts: vec![],
+            config,
         };
 
         bcutmodel.add_valid_inequalities();
@@ -401,7 +409,7 @@ impl BranchCutModel {
 
                     for k in 1..self.data.num_vertices {
                         if k != i && k != j {
-                            if (demand + self.data.d[k]).abs() as usize > self.data.capacity {
+                            if (demand + self.data.d[k]).abs() as f64 > self.data.capacity as f64 {
                                 invalid.push(k);
                             }
                         }
@@ -409,17 +417,14 @@ impl BranchCutModel {
 
                     if invalid.len() > 0 {
                         let lhs = self.x[i][j] + invalid.iter().map(|&k| self.x[j][k]).grb_sum();
-                        let cut = self.model.add_constr(&format!("Clique_{}_{}_out", i, j), c!(lhs <= 1.0)).unwrap();
-                        self.clique_cuts.push(cut);
+                        self.model.add_constr(&format!("Clique_{}_{}_out", i, j), c!(lhs <= 1.0)).unwrap();
 
                         let lhs = self.x[j][i] + invalid.iter().map(|&k| self.x[k][i]).grb_sum();
-                        let cut = self.model.add_constr(&format!("Clique_{}_{}_in", i, j), c!(lhs <= 1.0)).unwrap();
-                        self.clique_cuts.push(cut);
+                        self.model.add_constr(&format!("Clique_{}_{}_in", i, j), c!(lhs <= 1.0)).unwrap();
                     }
                 }
             }
         }
-        println!("Added {} clique cuts", self.clique_cuts.len());
     }
 
     pub fn solve(&mut self) {
@@ -432,8 +437,18 @@ impl BranchCutModel {
             gamma: self.gamma,
             capacity: self.data.capacity,
             num_vertices: self.data.num_vertices,
+            stats: CallbackStats {
+                subtour: 0,
+                capacity: 0,
+                tournament: 0,
+                frac_st: 0,
+                frac_cap: 0,
+            },
+            config: self.config,
         };
         self.model.set_param(LazyConstraints, 1).unwrap();
+        self.model.set_param(BranchDir, 1).unwrap(); // todo: is this better?
+        self.model.set_param(TimeLimit, self.config.tlimit as f64).unwrap();
         self.model.optimize_with_callback(&mut cb).unwrap();
         self.print_solution();
     }
@@ -491,7 +506,7 @@ impl BranchCutModel {
                 }
                 else {
                     theta_m[j][g] = (theta_m[j-1][g] + self.data.d[route[j]] as f64)
-                        .min(theta_m[j-1][g] + self.data.d[route[j]] as f64 - dev(self.data.d[route[j]], self.deviation.unwrap_or(0.0)));
+                        .min(theta_m[j-1][g-1] + self.data.d[route[j]] as f64 - dev(self.data.d[route[j]], self.deviation));
                 }
             }
         }
@@ -524,7 +539,7 @@ impl BranchCutModel {
                 }
                 else {
                     theta_p[j][g] = (theta_p[j-1][g] + self.data.d[route[j]] as f64)
-                        .min(theta_p[j-1][g] + self.data.d[route[j]] as f64 - dev(self.data.d[route[j]], self.deviation.unwrap_or(0.0)));
+                        .min(theta_p[j-1][g-1] + self.data.d[route[j]] as f64 - dev(self.data.d[route[j]], self.deviation));
                 }
             }
         }
@@ -551,13 +566,23 @@ struct VarData {
     j: usize,
 }
 
+struct CallbackStats {
+    subtour: usize,
+    capacity: usize,
+    tournament: usize,
+    frac_st: usize,
+    frac_cap: usize,
+}
+
 struct SeperationCallback {
     var_data: Vec<VarData>,
     d: Vec<isize>,
-    p: Option<f64>,
+    p: f64,
     gamma: usize,
     capacity: usize,
     num_vertices: usize,
+    stats: CallbackStats,
+    config: Config,
 }
 
 impl SeperationCallback {
@@ -604,17 +629,22 @@ impl SeperationCallback {
         routes
     }
 
-    fn add_capacity_cut(&self, ctx: &MIPSolCtx, in_nodes: &Vec<usize>, wc_nodes: &Vec<usize>) {
+    fn create_capacity_cut(&self, in_nodes: &Vec<usize>, wc_nodes: &Vec<usize>) -> IneqExpr {
         let mut rhs: usize = 1;
+        let wc_dev = wc_nodes.iter().map(|&i| dev(self.d[i], self.p)).sum::<f64>();
+        let normal_demand = in_nodes.iter().map(|&i| self.d[i] as f64).sum::<f64>();
         rhs = rhs.max(
-            ((in_nodes.iter().map(|&i| self.d[i] as f64).sum::<f64>()
-            + wc_nodes.iter().map(|&i| dev(self.d[i], self.p.unwrap_or(0.0))).sum::<f64>())
-            / (self.capacity as f64)).abs().ceil() as usize);
+            ((normal_demand + wc_dev) / (self.capacity as f64)).abs().ceil() as usize);
         rhs = rhs.max(
-            ((in_nodes.iter().map(|&i| self.d[i] as f64).sum::<f64>()
-            - wc_nodes.iter().map(|&i| dev(self.d[i], self.p.unwrap_or(0.0))).sum::<f64>())
-            / (self.capacity as f64)).abs().ceil() as usize);
+            ((normal_demand - wc_dev) / (self.capacity as f64)).abs().ceil() as usize);
 
+        if rhs == 1 {
+            if 2.0 * wc_dev > self.capacity as f64 {
+                // println!("Warning: Capacity cut rhs is 1, but wc_dev is too large: {}", wc_dev);
+                rhs = 2;
+            }
+        }
+        
         let mut vars: Vec<Var> = vec![];
         let out_nodes: Vec<usize> = (0..self.num_vertices).filter(|i| !in_nodes.contains(i)).collect();
         
@@ -627,13 +657,18 @@ impl SeperationCallback {
         }
 
         let lhs = vars.iter().grb_sum();
-        ctx.add_lazy(c!(lhs >= rhs as f64)).unwrap();
+        c!(lhs >= rhs as f64)
+    }
+
+    fn add_capacity_cut(&self, ctx: &MIPSolCtx, in_nodes: &Vec<usize>, wc_nodes: &Vec<usize>) {
+        ctx.add_lazy(self.create_capacity_cut(in_nodes, wc_nodes)).unwrap();
+        // println!("Added capacity cut for nodes {:?}, wc: {:?} with rhs: {:?}", in_nodes, wc_nodes, rhs);
     }
 
     fn add_tournament_cut(&self, ctx: &MIPSolCtx, route: Vec<usize>) {
         let k = route.len();
 
-        let lhs = self.var_data[route[0] * self.num_vertices + route[1]].x +
+        let lhs = self.var_data[route[0] * self.num_vertices + route[1]].x + 
             (1..k-1).map(|i| {
                 // println!("");
                 (i+1..k).map(|j| {
@@ -644,10 +679,137 @@ impl SeperationCallback {
                 }).grb_sum()
             }).grb_sum();
 
+        // let lhs_perm = (0..k).map(|i| {
+        //     (i+1..k).map(|j| {
+        //         &self.var_data[route[i] * self.num_vertices + route[j]].x
+        //     }).grb_sum()
+        // }).grb_sum() + (1..k).map(|i| {
+        //     (i+1..k).map(|j| {
+        //         &self.var_data[route[j] * self.num_vertices + route[i]].x
+        //     }).grb_sum()
+        // }).grb_sum();
+
         let rhs = k-2;
         ctx.add_lazy(c!(lhs <= rhs as f64)).unwrap();
-        // println!("Added tournament cut for route {:?}, lt {}", route, rhs);
     }   
+
+    fn seperate_frac_sep_st(&self, ctx: &MIPNodeCtx) -> bool {
+        let soln = ctx.get_solution(self.var_data.iter().map(|vd| vd.x).collect::<Vec<_>>());
+
+        if soln.is_err() {
+            return false;
+        }
+
+        let soln = soln.unwrap();
+
+        let mut data = vec![];
+        for (idx, vd) in self.var_data.iter().enumerate() {
+            if soln[idx] > EPS {
+                let from = vd.i;
+                let to = vd.j;
+                let cost = soln[idx];
+                data.push((from, to, cost));
+            }
+        }
+
+        let mut graph = Graph::new(data, self.num_vertices);
+        let mut added_cuts = false;
+        for target in 1..self.num_vertices {
+            let flow = graph.min_cut(0, target);
+            if flow < 1.0 - EPS {
+                added_cuts = true;
+                ctx.add_lazy(self.create_capacity_cut(&graph.target_cut, &Vec::new())).unwrap();
+                return added_cuts;
+            }
+            graph.reset();
+        }
+        added_cuts
+    }
+
+    fn seperate_frac_sep_cap(&self, ctx: &MIPNodeCtx) -> bool {
+        let mut added_cuts = false;
+        let soln = ctx.get_solution(self.var_data.iter().map(|vd| vd.x).collect::<Vec<_>>());
+
+        if soln.is_err() {
+            return false;
+        }
+
+        let soln = soln.unwrap();
+        let n = self.num_vertices;
+
+        let mut data = vec![];
+        for (idx, vd) in self.var_data.iter().enumerate() {
+            if soln[idx] > EPS {
+                let from = vd.i;
+                let to = vd.j;
+                let cost = soln[idx];
+                data.push((from, to, cost));
+            }
+        }
+
+        let mut required_flow = 0.0;
+        for station in 1..n {
+            if self.d[station] > 0 {
+                data.push((n, station, self.d[station] as f64 / self.capacity as f64));
+            }
+            if self.d[station] < 0 {
+                required_flow += -self.d[station] as f64 / self.capacity as f64;
+                data.push((station, n+1, -self.d[station] as f64 / self.capacity as f64));
+            }
+        }
+
+        let mut graph = Graph::new(data, n + 2);
+        let min_cut = graph.min_cut(n, n+1);
+
+        if min_cut < required_flow - EPS {
+            let in_nodes: Vec<usize> = graph.target_cut.iter().filter_map(|&i| {if i < n {Some(i)} else {None}}).collect();
+            let wc_nodes: Vec<usize> = Vec::new();
+            if in_nodes.len() != self.num_vertices {
+                let cut = self.create_capacity_cut(&in_nodes, &wc_nodes);
+                ctx.add_lazy(cut).unwrap();
+                added_cuts = true;
+                return added_cuts;
+            }
+        }
+
+        let mut data = vec![];
+        
+        for (idx, vd) in self.var_data.iter().enumerate() {
+            if soln[idx] > EPS {
+                let from = vd.i;
+                let to = vd.j;
+                let cost = soln[idx];
+                data.push((from, to, cost));
+            }
+        }
+
+        let mut required_flow = 0.0;
+        for station in 1..n {
+            if self.d[station] > 0 {
+                required_flow += self.d[station] as f64 / self.capacity as f64;
+                data.push((station, n+1, self.d[station] as f64 / self.capacity as f64));
+            }
+            if self.d[station] < 0 {
+                data.push((n, station, -self.d[station] as f64 / self.capacity as f64));
+            }
+        }
+
+        let mut graph = Graph::new(data, n + 2);
+        let min_cut = graph.min_cut(n, n+1);
+
+        if min_cut < required_flow - EPS {
+            let in_nodes: Vec<usize> = graph.target_cut.iter().filter_map(|&i| {if i < n {Some(i)} else {None}}).collect();
+            let wc_nodes: Vec<usize> = Vec::new();
+            if in_nodes.len() != self.num_vertices {
+                let cut = self.create_capacity_cut(&in_nodes, &wc_nodes);
+                ctx.add_lazy(cut).unwrap();
+                added_cuts = true;
+                return added_cuts;
+            }
+        }
+
+        added_cuts
+    }
 }
 
 impl Callback for SeperationCallback {
@@ -655,48 +817,18 @@ impl Callback for SeperationCallback {
         match w {
             Where::MIPSol(ctx) => {
                 let routes = self.seperate_routes(&ctx);
-                let mut added_cuts = false;
+                let mut subtour_cuts = 0;
+                let mut cap_cuts = 0;
+                let mut tour_cuts = 0;
+
                 for route in routes.iter() {
                     if !route.iter().any(|vd| vd.i == 0) {
-                        // Sub-tour cuts
-                        // let lhs = route.iter().map(|vd| vd.x).grb_sum();
-                        // let mut rhs = 1.0;
-                        // let tot_demand = route.iter().map(|vd| self.d[vd.i] as f64).sum::<f64>();
-
-                        // if self.p.is_some() {
-                        //     let mut devs: Vec<f64> = route.iter().map(|vd| dev(self.d[vd.i], self.p.unwrap())).collect();
-                        //     devs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                        //     let mut dev_sum = 0.0;
-                        //     for i in 0..self.gamma {
-                        //         if i < devs.len() {
-                        //             dev_sum += devs[i];
-                        //         } else {
-                        //             break;
-                        //         }
-                        //     }
-
-                        //     let up = ((tot_demand + dev_sum) / (self.capacity as f64)).abs().ceil();
-                        //     let down = ((tot_demand - dev_sum) / (self.capacity as f64)).abs().ceil();
-
-                        //     if up > rhs {
-                        //         rhs = up;
-                        //     }
-                        //     if down > rhs {
-                        //         rhs = down;
-                        //     }
-                        // } else {
-                        //     if (tot_demand / (self.capacity as f64)).abs() > rhs {
-                        //         rhs = (tot_demand / (self.capacity as f64)).abs().ceil();
-                        //     }
-                        // }
-                        // ctx.add_lazy(c!(lhs >= rhs)).unwrap();
                         let nodes = route.iter().map(|vd| vd.i).collect::<Vec<_>>();
                         self.add_capacity_cut(&ctx, &nodes, &vec![]);
-                        // println!("Added sub-tour cut for nodes {:?}", nodes);
-                        added_cuts = true;
+                        subtour_cuts += 1;
                     }
                 }
-                if added_cuts == false {
+                if subtour_cuts == 0 {
                     for route in routes.iter() {
                         let mut theta_minus: f64 = 0.0;
                         let mut theta_plus: f64 = 0.0;
@@ -704,7 +836,6 @@ impl Callback for SeperationCallback {
                         let mut theta_plus_max: f64 = 0.0;
                         let mut l = vec![];
                         let mut first_infeasible: isize = -1;
-                        let mut sep_cap_added_cuts = false;
 
                         for k in 1..route.len() {
                             let i = route[k].i;
@@ -713,24 +844,26 @@ impl Callback for SeperationCallback {
 
                             if self.gamma > 0 {
                                 if l.len() < self.gamma {
-                                    theta_minus -= dev(self.d[i], self.p.unwrap());
-                                    theta_plus += dev(self.d[i], self.p.unwrap());
+                                    theta_minus -= dev(self.d[i], self.p);
+                                    theta_plus += dev(self.d[i], self.p);
                                     l.push(i);
                                 }
                                 else {
-                                    let j = l.iter().enumerate().fold(0, |min_idx, (idx, &wc)| {
-                                        if dev(self.d[wc], self.p.unwrap()) < dev(self.d[l[min_idx]], self.p.unwrap()) {
-                                            idx
-                                        } else {
-                                            min_idx
+                                    // Find the argmin of l
+                                    let mut argmin = 0;
+                                    let mut min = dev(self.d[l[argmin]], self.p);
+                                    for (idx, station) in l.iter().enumerate() {
+                                        if dev(self.d[*station], self.p) < min {
+                                            argmin = idx;
+                                            min = dev(self.d[*station], self.p);
                                         }
-                                    });
-                                    let dev_i = dev(self.d[i], self.p.unwrap());
-                                    let dev_j = dev(self.d[l[j]], self.p.unwrap());
-                                    if dev_i > dev_j {
-                                        theta_minus += dev_j - dev_i;
-                                        theta_plus += dev_i - dev_j;
-                                        l[j] = i;
+                                    }
+                                    let dev_i = dev(self.d[i], self.p);
+                                    let dev_min = dev(self.d[l[argmin]], self.p);
+                                    if dev_i > dev_min {
+                                        theta_minus += dev_min - dev_i;
+                                        theta_plus += dev_i - dev_min;
+                                        l[argmin] = i;
                                     }
                                 }
                             }
@@ -739,28 +872,38 @@ impl Callback for SeperationCallback {
 
                             if theta_plus_max - theta_minus_min > self.capacity as f64 {
                                 if first_infeasible == -1 {
-                                    // println!("Tournament required at index {}", k);
                                     first_infeasible = k as isize;
                                 }
                             }
 
-                            if theta_minus.abs() > self.capacity as f64 || theta_plus.abs() > self.capacity as f64 {
+                            if theta_minus.abs() > self.capacity as f64 || theta_plus.abs() > self.capacity as f64 || (if self.config.robust_capacity_cuts { (theta_plus - theta_minus).abs() > self.capacity as f64 } else { false }) {
                                 // Add capacity cut
                                 let nodes = route[1..k+1].iter().map(|vd| vd.i).collect();
                                 self.add_capacity_cut(&ctx, &nodes, &l);
-                                // println!("Added capacity cut for nodes {:?}", nodes);
-                                sep_cap_added_cuts = true;
+                                cap_cuts += 1;
+                                // break 'in_route;
                             }
                         }
-                        if sep_cap_added_cuts == false && first_infeasible > 0 {
+                        if cap_cuts == 0 && first_infeasible > 0 {
                             // add tournament cut
                             self.add_tournament_cut(&ctx, route[..(first_infeasible as usize + 1)].iter().map(|vd| vd.i).collect());
-                            // println!("Added tournament cut");
+                            tour_cuts += 1;
                         }
                     }
-
                 }
+                self.stats.subtour += subtour_cuts;
+                self.stats.capacity += cap_cuts;
+                self.stats.tournament += tour_cuts;
             },
+            Where::MIPNode(ctx) => {
+                let result = if self.config.frac_st { self.seperate_frac_sep_st(&ctx) } else { false };
+                if result {
+                    self.stats.frac_st += 1;
+                } else {
+                    let new_result = if self.config.frac_cap { self.seperate_frac_sep_cap(&ctx) } else { false };
+                    self.stats.frac_cap += if new_result { 1 } else { 0 };
+                }
+            }
             _ => {},
         }
         Ok(())

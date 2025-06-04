@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 grb = { version = "3.0.1", features = ["gurobi12"] }
+chrono = { version = "0.4.41" }

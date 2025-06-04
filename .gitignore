@@ -2,3 +2,5 @@ instances
 detailed results.xlsx
 target
 Results
+scraper.py
+gurobi.log
