@@ -78,7 +78,7 @@ const TLIMIT: usize = 900;
 fn benchmark() {
     let instances= vec![1, 3, 5, 8, 11, 14, 19];
     let gammas = vec![0, 1, 5, 10];
-    let devs = vec![0.1, 0.25, 0.5];
+    let devs = vec![0.0, 0.1, 0.25, 0.5];
     let tlimit = TLIMIT;
 
     let folder = "Results";
@@ -88,16 +88,16 @@ fn benchmark() {
     let frac_st = false;
     let frac_cap = false;
     let robust_capacity_cuts = false;
-    let name = "Incumbent";
+    let name = "Compact";
 
     std::fs::create_dir_all(format!("{}/{}/{}", folder, datetime, name)).expect("Failed to create directory");
 
-    for instance in instances {
+    for instance in instances.iter() {
         println!("Benchmarking instance {}:", instance);
         let mut writer = File::create(format!("{}/{}/{}/{}.txt", folder, datetime, name, instance)).expect("Failed to create file");
         for gamma in gammas.iter() {
             for dev in devs.iter() {
-                if *dev == 0.0 && *gamma > 0 {
+                if (*dev == 0.0 && *gamma > 0) || (*dev > 0.0 && *gamma == 0) {
                     continue;
                 }
                 let config = Config {
@@ -109,7 +109,7 @@ fn benchmark() {
                     robust_capacity_cuts,
                 };
 
-                let mut model = BranchCutModel::new(FILENAMES[instance-1], config);
+                let mut model = CompactModel::new(FILENAMES[instance-1], config);
                 model.solve();
 
                 let status = model.model.status()
@@ -185,8 +185,8 @@ fn main() {
     }
 
     let tlimit = TLIMIT;
-    let frac_st = true;
-    let frac_cap = true;
+    let frac_st = false;
+    let frac_cap = false;
     let robust_capacity_cuts = true;
 
     let config = Config {

@@ -630,20 +630,22 @@ impl SeperationCallback {
     }
 
     fn create_capacity_cut(&self, in_nodes: &Vec<usize>, wc_nodes: &Vec<usize>) -> IneqExpr {
-        let mut rhs: usize = 1;
         let wc_dev = wc_nodes.iter().map(|&i| dev(self.d[i], self.p)).sum::<f64>();
         let normal_demand = in_nodes.iter().map(|&i| self.d[i] as f64).sum::<f64>();
+        
+        let mut rhs: usize = (wc_dev * 2.0 / self.capacity as f64).ceil() as usize; // could be 0 if wc_nodes is empty
+        rhs = rhs.max(1);
         rhs = rhs.max(
             ((normal_demand + wc_dev) / (self.capacity as f64)).abs().ceil() as usize);
         rhs = rhs.max(
             ((normal_demand - wc_dev) / (self.capacity as f64)).abs().ceil() as usize);
 
-        if rhs == 1 {
-            if 2.0 * wc_dev > self.capacity as f64 {
-                // println!("Warning: Capacity cut rhs is 1, but wc_dev is too large: {}", wc_dev);
-                rhs = 2;
-            }
-        }
+        // if rhs == 1 {
+        //     if 2.0 * wc_dev > self.capacity as f64 {
+        //         // println!("Warning: Capacity cut rhs is 1, but wc_dev is too large: {}", wc_dev);
+        //         rhs = 2;
+        //     }
+        // }
         
         let mut vars: Vec<Var> = vec![];
         let out_nodes: Vec<usize> = (0..self.num_vertices).filter(|i| !in_nodes.contains(i)).collect();
